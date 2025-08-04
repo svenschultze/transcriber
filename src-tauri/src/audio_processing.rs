@@ -1,4 +1,4 @@
-use crate::{silero, utils, vad_iter};
+use crate::{utils};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
