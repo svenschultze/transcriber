@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 const audioFile = ref<File | null>(null);
 const vadResults = ref<any[]>([]);
@@ -14,6 +15,32 @@ const projectName = ref("Untitled Project");
 const showFileMenu = ref(false);
 const showEditMenu = ref(false);
 const showHelpMenu = ref(false);
+const originalAudioBase64 = ref<string>("");
+const showAudioPlayer = ref(false);
+const currentSegmentInfo = ref<string>("");
+const currentTime = ref(0);
+const duration = ref(0);
+const isPlaying = ref(false);
+const currentHighlightedSegment = ref<number>(-1);
+
+// Settings
+const showSettings = ref(false);
+const apiKey = ref("sk-...");
+const baseUrl = ref("https://api.openai.com/v1");
+const modelName = ref("whisper-1");
+
+// Progress tracking
+const processingProgress = ref(0);
+const processingStep = ref("");
+const processingSteps = [
+  "Reading audio file...",
+  "Decoding audio format...", 
+  "Resampling audio...",
+  "Running voice detection...",
+  "Analyzing speech segments...",
+  "Merging segments...",
+  "Finalizing results..."
+];
 
 // Track Ctrl key state for visual feedback
 function handleKeyDown(event: KeyboardEvent) {
@@ -50,6 +77,20 @@ import { onMounted, onUnmounted } from "vue";
 onMounted(() => {
   document.addEventListener('keydown', handleKeyDown);
   document.addEventListener('keyup', handleKeyUp);
+  
+  // Load settings from localStorage
+  loadSettings();
+  
+  // Listen for audio processing progress events
+  listen('audio-processing-progress', (event) => {
+    const progressData = event.payload as { step: string; progress: number; details?: string };
+    processingStep.value = progressData.step;
+    processingProgress.value = progressData.progress;
+    
+    if (progressData.details) {
+      console.log(`Progress: ${progressData.step} (${progressData.progress}%) - ${progressData.details}`);
+    }
+  });
 });
 
 onUnmounted(() => {
@@ -57,16 +98,46 @@ onUnmounted(() => {
   document.removeEventListener('keyup', handleKeyUp);
 });
 
+// Settings management
+function loadSettings() {
+  const savedApiKey = localStorage.getItem('transcriber-api-key');
+  const savedBaseUrl = localStorage.getItem('transcriber-base-url');
+  const savedModelName = localStorage.getItem('transcriber-model-name');
+  
+  if (savedApiKey) apiKey.value = savedApiKey;
+  if (savedBaseUrl) baseUrl.value = savedBaseUrl;
+  if (savedModelName) modelName.value = savedModelName;
+}
+
+function saveSettings() {
+  localStorage.setItem('transcriber-api-key', apiKey.value);
+  localStorage.setItem('transcriber-base-url', baseUrl.value);
+  localStorage.setItem('transcriber-model-name', modelName.value);
+  showSettings.value = false;
+}
+
+function resetSettings() {
+  apiKey.value = "sk-...";
+  baseUrl.value = "https://api.openai.com/v1";
+  modelName.value = "whisper-1";
+}
+
 async function handleFileSelect(event: Event) {
   const target = event.target as HTMLInputElement;
   if (target.files && target.files[0]) {
     audioFile.value = target.files[0];
     vadResults.value = [];
     errorMsg.value = "";
+    originalAudioBase64.value = "";
+    
+    // Set project title to file name without extension
+    const fileName = target.files[0].name;
+    const nameWithoutExtension = fileName.substring(0, fileName.lastIndexOf('.')) || fileName;
+    projectName.value = nameWithoutExtension;
     
     // Immediately show processing indicator
     isProcessing.value = true;
-    transcriptionStatus.value = `Loading ${target.files[0].name}...`;
+    transcriptionStatus.value = `Loading ${fileName}...`;
     
     await processAudio();
   }
@@ -81,27 +152,50 @@ async function processAudio() {
   isProcessing.value = true;
   errorMsg.value = "";
   vadResults.value = [];
-  transcriptionStatus.value = "Preparing audio file...";
+  originalAudioBase64.value = "";
+  processingProgress.value = 0;
+  processingStep.value = "Preparing audio file...";
 
   try {
-    // Convert file to array buffer, then to bytes
-    transcriptionStatus.value = "Reading audio file...";
+    // Frontend preparation steps (quick operations)
+    processingStep.value = "Reading audio file...";
+    processingProgress.value = 2;
+    
     const arrayBuffer = await audioFile.value.arrayBuffer();
     const bytes = Array.from(new Uint8Array(arrayBuffer));
     
-    // Save file to temporary location
-    transcriptionStatus.value = "Saving audio file...";
+    processingStep.value = "Encoding audio for playback...";
+    processingProgress.value = 5;
+    
+    const uint8Array = new Uint8Array(arrayBuffer);
+    let binaryString = '';
+    const chunkSize = 8192;
+    
+    for (let i = 0; i < uint8Array.length; i += chunkSize) {
+      const chunk = uint8Array.slice(i, i + chunkSize);
+      binaryString += String.fromCharCode.apply(null, Array.from(chunk));
+    }
+    
+    originalAudioBase64.value = btoa(binaryString);
+    createAudioPlayer();
+    
+    processingStep.value = "Saving audio file...";
+    processingProgress.value = 8;
+    
     const tempFilePath = await invoke("save_audio_file", { 
       fileData: bytes, 
       filename: audioFile.value.name 
     });
     
-    // Process the audio file
-    transcriptionStatus.value = "Analyzing audio with voice activity detection...";
+    // Backend processing with real progress events
+    processingStep.value = "Initializing audio processing...";
+    processingProgress.value = 10;
+    
+    // The backend will emit progress events that automatically update our progress
     const segments = await invoke("process_audio_vad", { filePath: tempFilePath });
     vadResults.value = segments as any[];
     
-    transcriptionStatus.value = `Found ${vadResults.value.length} speech segments. Starting transcription...`;
+    transcriptionStatus.value = `Found ${vadResults.value.length} speech segments. Ready for transcription.`;
     
     // Automatically start transcription after VAD processing
     if (vadResults.value.length > 0) {
@@ -124,42 +218,175 @@ function formatTime(seconds: number): string {
   return `${mins}:${secs.padStart(5, '0')}`;
 }
 
-function playSegment(segment: any) {
-  if (!segment.audio_base64) {
-    console.error("No audio data available for this segment");
-    return;
+function formatFileSize(bytes: number): string {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function updateHighlightedSegment() {
+  if (!vadResults.value.length || !currentAudio.value) return;
+  
+  const currentTimeValue = currentAudio.value.currentTime;
+  
+  // Find the segment that contains the current time
+  let foundIndex = -1;
+  for (let i = 0; i < vadResults.value.length; i++) {
+    const segment = vadResults.value[i];
+    if (currentTimeValue >= segment.start_time_seconds && currentTimeValue <= segment.end_time_seconds) {
+      foundIndex = i;
+      break;
+    }
   }
+  
+  currentHighlightedSegment.value = foundIndex;
+}
+
+function createAudioPlayer() {
+  if (!originalAudioBase64.value) return;
   
   // Stop any currently playing audio
   if (currentAudio.value) {
     currentAudio.value.pause();
-    currentAudio.value.currentTime = 0;
+    currentAudio.value = null;
   }
   
-  // Create new audio element and play the segment
-  const audio = new Audio(`data:audio/wav;base64,${segment.audio_base64}`);
+  // Determine the MIME type based on the original file
+  let mimeType = 'audio/wav'; // default
+  if (audioFile.value) {
+    const fileName = audioFile.value.name.toLowerCase();
+    if (fileName.endsWith('.mp3')) mimeType = 'audio/mpeg';
+    else if (fileName.endsWith('.m4a') || fileName.endsWith('.aac')) mimeType = 'audio/aac';
+    else if (fileName.endsWith('.flac')) mimeType = 'audio/flac';
+    else if (fileName.endsWith('.ogg')) mimeType = 'audio/ogg';
+  }
+  
+  // Create new audio element with the original audio file
+  const audio = new Audio(`data:${mimeType};base64,${originalAudioBase64.value}`);
   currentAudio.value = audio;
   
-  // Clear the reference when audio ends
+  // Set up event listeners
+  audio.addEventListener('loadedmetadata', () => {
+    duration.value = audio.duration;
+    currentTime.value = audio.currentTime;
+  });
+  
+  audio.addEventListener('timeupdate', () => {
+    currentTime.value = audio.currentTime;
+    updateHighlightedSegment();
+  });
+  
+  audio.addEventListener('play', () => {
+    isPlaying.value = true;
+  });
+  
+  audio.addEventListener('pause', () => {
+    isPlaying.value = false;
+  });
+  
   audio.addEventListener('ended', () => {
-    if (currentAudio.value === audio) {
-      currentAudio.value = null;
-    }
+    isPlaying.value = false;
+    currentTime.value = 0;
   });
   
-  // Clear the reference if audio fails to play
   audio.addEventListener('error', () => {
-    if (currentAudio.value === audio) {
-      currentAudio.value = null;
-    }
+    console.error("Error loading audio");
+    currentAudio.value = null;
+    showAudioPlayer.value = false;
   });
   
-  audio.play().catch(error => {
+  // Show the audio player
+  showAudioPlayer.value = true;
+}
+
+function playSegment(segment: any) {
+  if (!currentAudio.value) {
+    createAudioPlayer();
+    if (!currentAudio.value) return;
+  }
+  
+  // Jump to the segment start time
+  currentAudio.value.currentTime = Math.max(segment.start_time_seconds - 1, 0);
+  
+  // Play the audio
+  currentAudio.value.play().catch(error => {
     console.error("Error playing audio:", error);
-    if (currentAudio.value === audio) {
-      currentAudio.value = null;
-    }
   });
+}
+
+function togglePlayPause() {
+  if (!currentAudio.value) {
+    createAudioPlayer();
+    if (!currentAudio.value) return;
+  }
+  
+  if (isPlaying.value) {
+    currentAudio.value.pause();
+  } else {
+    currentAudio.value.play().catch(error => {
+      console.error("Error playing audio:", error);
+    });
+  }
+}
+
+function seekToTime(time: number) {
+  if (currentAudio.value) {
+    currentAudio.value.currentTime = Math.max(0, Math.min(time, duration.value));
+  }
+}
+
+function handleSliderChange(event: Event) {
+  const target = event.target as HTMLInputElement;
+  const newTime = parseFloat(target.value);
+  seekToTime(newTime);
+}
+
+function jumpToPreviousSegment() {
+  if (!vadResults.value.length || !currentAudio.value) return;
+  
+  const currentTimeValue = currentAudio.value.currentTime;
+  let targetSegment = null;
+  
+  // Find the previous segment
+  for (let i = vadResults.value.length - 1; i >= 0; i--) {
+    const segment = vadResults.value[i];
+    if (segment.start_time_seconds < currentTimeValue - 1) {
+      targetSegment = segment;
+      break;
+    }
+  }
+  
+  if (targetSegment) {
+    currentAudio.value.currentTime = Math.max(targetSegment.start_time_seconds - 1, 0);
+  } else {
+    // Jump to beginning if no previous segment
+    currentAudio.value.currentTime = 0;
+  }
+}
+
+function jumpToNextSegment() {
+  if (!vadResults.value.length || !currentAudio.value) return;
+  
+  const currentTimeValue = currentAudio.value.currentTime;
+  let targetSegment = null;
+  
+  // Find the next segment
+  for (let i = 0; i < vadResults.value.length; i++) {
+    const segment = vadResults.value[i];
+    if (segment.start_time_seconds > currentTimeValue + 1) {
+      targetSegment = segment;
+      break;
+    }
+  }
+  
+  if (targetSegment) {
+    currentAudio.value.currentTime = Math.max(targetSegment.start_time_seconds - 1, 0);
+  } else {
+    // Jump to end if no next segment
+    currentAudio.value.currentTime = duration.value;
+  }
 }
 
 function handleSegmentClick(event: MouseEvent, segment: any) {
@@ -178,6 +405,8 @@ function handleSegmentEdit(event: Event, segment: any, index: number) {
 
 async function transcribeSegment(segment: any, index: number) {
   if (!segment.audio_base64) {
+    // We'll need to extract the segment audio from the original file
+    // For now, we'll pass the segment info to the backend to handle extraction
     errorMsg.value = "No audio data available for this segment";
     return;
   }
@@ -190,7 +419,10 @@ async function transcribeSegment(segment: any, index: number) {
     // Call the Rust backend for transcription
     const transcription = await invoke("transcribe_audio", { 
       audioBase64: segment.audio_base64, 
-      segmentIndex: index 
+      segmentIndex: index,
+      apiKey: apiKey.value,
+      baseUrl: baseUrl.value,
+      modelName: modelName.value
     });
     
     segment.transcription = transcription as string;
@@ -210,7 +442,7 @@ async function transcribeAllSegments() {
   }
 
   isTranscribing.value = true;
-  transcriptionStatus.value = "Transcribing segments...";
+  transcriptionStatus.value = "Starting transcription...";
   errorMsg.value = "";
 
   let completed = 0;
@@ -220,7 +452,7 @@ async function transcribeAllSegments() {
     // Transcribe segments sequentially to avoid rate limiting
     for (let i = 0; i < vadResults.value.length; i++) {
       const segment = vadResults.value[i];
-      transcriptionStatus.value = `Transcribing segment ${i + 1} of ${total}...`;
+      transcriptionStatus.value = `Transcribing segment ${i + 1} of ${total}... (${Math.round((completed / total) * 100)}%)`;
       
       await transcribeSegment(segment, i);
       completed++;
@@ -246,14 +478,15 @@ async function saveProject() {
     const projectData = {
       name: projectName.value,
       audioFileName: audioFile.value?.name || '',
+      originalAudioBase64: originalAudioBase64.value,
       segments: vadResults.value.map(segment => ({
         start_sample: segment.start_sample,
         end_sample: segment.end_sample,
         start_time_seconds: segment.start_time_seconds,
         end_time_seconds: segment.end_time_seconds,
         transcription: segment.transcription || '',
-        audio_base64: segment.audio_base64 || '',
-        audio_data: segment.audio_data || []
+        // Only keep audio_base64 if it exists (for backward compatibility)
+        ...(segment.audio_base64 && { audio_base64: segment.audio_base64 })
       }))
     };
     
@@ -284,6 +517,9 @@ async function loadProject(event: Event) {
     
     projectName.value = projectData.name || 'Loaded Project';
     
+    // Restore original audio if available
+    originalAudioBase64.value = projectData.originalAudioBase64 || '';
+    
     // Restore segments with all their data
     vadResults.value = (projectData.segments || []).map((segment: any) => ({
       start_sample: segment.start_sample || 0,
@@ -291,14 +527,28 @@ async function loadProject(event: Event) {
       start_time_seconds: segment.start_time_seconds || 0,
       end_time_seconds: segment.end_time_seconds || 0,
       transcription: segment.transcription || '',
+      // Keep audio_base64 for backward compatibility with old projects
       audio_base64: segment.audio_base64 || '',
       audio_data: segment.audio_data || [],
       isTranscribing: false,
       transcriptionError: null
     }));
     
+    // If we have the original audio but no filename was saved, create a mock file reference
+    if (originalAudioBase64.value && !audioFile.value) {
+      // Create a filename based on the project name
+      const audioFileName = projectData.audioFileName || `${projectData.name || 'audio'}.wav`;
+      // We can't recreate the File object, but we can store the filename for display
+      // audioFile.value will remain null, but we have originalAudioBase64.value for playback
+    }
+    
     // Clear the file input
     target.value = '';
+    
+    // Create audio player if we have original audio data
+    if (originalAudioBase64.value) {
+      createAudioPlayer();
+    }
     
     // Show success message
     transcriptionStatus.value = `Loaded project with ${vadResults.value.length} segments`;
@@ -441,9 +691,22 @@ function closeAllMenus() {
 function newProject() {
   vadResults.value = [];
   audioFile.value = null;
+  originalAudioBase64.value = "";
   projectName.value = "Untitled Project";
   errorMsg.value = "";
   transcriptionStatus.value = "";
+  showAudioPlayer.value = false;
+  currentSegmentInfo.value = "";
+  currentTime.value = 0;
+  duration.value = 0;
+  isPlaying.value = false;
+  currentHighlightedSegment.value = -1;
+  processingProgress.value = 0;
+  processingStep.value = "";
+  if (currentAudio.value) {
+    currentAudio.value.pause();
+    currentAudio.value = null;
+  }
   closeAllMenus();
 }
 
@@ -512,7 +775,7 @@ function copyAll() {
               <span class="menu-shortcut">Ctrl+O</span>
             </div>
             <div class="menu-option" @click="openAudioFile">
-              <span class="menu-icon">🎵</span>
+              <span class="menu-icon">♪</span>
               <span>Open Audio File...</span>
             </div>
             <div class="menu-separator"></div>
@@ -523,7 +786,7 @@ function copyAll() {
             </div>
             <div class="menu-separator"></div>
             <div class="menu-submenu" v-if="vadResults.length > 0">
-              <span class="menu-icon">📤</span>
+              <span class="menu-icon">↗</span>
               <span>Export</span>
               <span class="menu-arrow">▶</span>
               <div class="submenu">
@@ -533,7 +796,7 @@ function copyAll() {
                   <span class="menu-shortcut">Ctrl+E</span>
                 </div>
                 <div class="menu-option" @click="exportAsMarkdown">
-                  <span class="menu-icon">📝</span>
+                  <span class="menu-icon">⬇</span>
                   <span>Markdown (.md)</span>
                   <span class="menu-shortcut">Ctrl+Shift+E</span>
                 </div>
@@ -554,7 +817,7 @@ function copyAll() {
           Edit
           <div v-if="showEditMenu" class="dropdown-menu">
             <div class="menu-option" @click="selectAll" :class="{ disabled: vadResults.length === 0 }">
-              <span class="menu-icon">🔲</span>
+              <span class="menu-icon">⬜</span>
               <span>Select All</span>
               <span class="menu-shortcut">Ctrl+A</span>
             </div>
@@ -563,6 +826,11 @@ function copyAll() {
               <span>Copy All Text</span>
               <span class="menu-shortcut">Ctrl+C</span>
             </div>
+            <div class="menu-separator"></div>
+            <div class="menu-option" @click="showSettings = true">
+              <span class="menu-icon">⚙️</span>
+              <span>Settings</span>
+            </div>
           </div>
         </div>
         
@@ -570,7 +838,7 @@ function copyAll() {
           Help
           <div v-if="showHelpMenu" class="dropdown-menu">
             <div class="menu-option disabled">
-              <span class="menu-icon">ℹ️</span>
+              <span class="menu-icon">ℹ</span>
               <span>About Transcriber</span>
             </div>
             <div class="menu-separator"></div>
@@ -597,11 +865,11 @@ function copyAll() {
       
       <div class="toolbar-right">
         <div class="status-indicator" v-if="isProcessing">
-          <span class="spinner">⏳</span>
+          <span class="spinner">⌛</span>
           Processing...
         </div>
         <div class="status-indicator" v-else-if="isTranscribing">
-          <span class="spinner">⏳</span>
+          <span class="spinner">⌛</span>
           Transcribing...
         </div>
       </div>
@@ -628,14 +896,56 @@ function copyAll() {
       <!-- Processing Indicator -->
       <div v-if="isProcessing" class="processing-section">
         <div class="processing-card">
-          <div class="processing-spinner">⏳</div>
-          <h3>Processing Audio</h3>
-          <p v-if="transcriptionStatus">{{ transcriptionStatus }}</p>
-          <p v-else>Please wait while we process your audio file...</p>
-          <div class="processing-steps">
-            <small>• Reading and analyzing audio file</small><br>
-            <small>• Detecting speech segments with AI</small><br>
-            <small>• Preparing for transcription</small>
+          <div class="processing-header">
+            <div class="processing-spinner">⌛</div>
+            <h3>Processing Audio</h3>
+          </div>
+          
+          <!-- Progress Bar -->
+          <div class="progress-section">
+            <div class="progress-info">
+              <span class="progress-percentage">{{ processingProgress.toFixed(0) }}%</span>
+            </div>
+            <div class="progress-bar-container">
+              <div class="progress-bar-track">
+                <div 
+                  class="progress-bar-fill" 
+                  :style="{ width: `${processingProgress}%` }"
+                ></div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- File Info -->
+          <div class="file-info" v-if="audioFile">
+            <div class="file-details">
+              <span class="file-icon">♪</span>
+              <div class="file-text">
+                <div class="file-name">{{ audioFile.name }}</div>
+                <div class="file-size">{{ formatFileSize(audioFile.size) }}</div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- Processing Steps -->
+          <div class="processing-steps-list">
+            <div 
+              v-for="(step, index) in processingSteps" 
+              :key="index"
+              class="processing-step"
+              :class="{
+                'completed': processingProgress > (index * 100 / processingSteps.length),
+                'active': step === processingStep,
+                'pending': processingProgress <= (index * 100 / processingSteps.length)
+              }"
+            >
+              <div class="step-indicator">
+                <span v-if="processingProgress > ((index + 1) * 100 / processingSteps.length)" class="step-check">✓</span>
+                <span v-else-if="step === processingStep" class="step-spinner">⌛</span>
+                <span v-else class="step-number">{{ index + 1 }}</span>
+              </div>
+              <span class="step-text">{{ step }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -646,7 +956,8 @@ function copyAll() {
           <h2>Get Started</h2>
           <p>Upload an audio file to begin transcription</p>
           <button @click="openAudioFile" class="primary-button">
-            🎵 Select Audio File
+            <span style="margin-right: 8px;">♪</span>
+            Select Audio File
           </button>
           <p class="file-hint">Supports WAV, MP3, M4A, AAC, FLAC, and OGG formats</p>
         </div>
@@ -657,9 +968,6 @@ function copyAll() {
       </div>
 
       <div v-if="vadResults.length > 0" class="results">
-        <h3>Transcription Editor</h3>
-        <p v-if="transcriptionStatus" class="transcription-status">{{ transcriptionStatus }}</p>
-        
         <div class="transcription-editor">
           <div class="editor-controls">
             <span class="segment-count">{{ vadResults.filter(s => s.transcription).length }} segments</span>
@@ -668,7 +976,7 @@ function copyAll() {
           
           <div class="transcription-text">
             <div v-for="(segment, index) in vadResults" :key="index" class="segment-line">
-              <div v-if="segment.transcription" class="segment-container">
+              <div v-if="segment.transcription != null" class="segment-container" :class="{ 'highlighted': currentHighlightedSegment === index }">
                 <div class="segment-meta">
                   <span class="segment-number">{{ index + 1 }}</span>
                   <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
@@ -682,33 +990,147 @@ function copyAll() {
                   spellcheck="false"
                   title="CTRL+Click to play audio segment">{{ segment.transcription }}</span>
               </div>
-              <div v-else-if="segment.isTranscribing" class="segment-container loading">
+              <div v-else-if="segment.isTranscribing" class="segment-container loading" :class="{ 'highlighted': currentHighlightedSegment === index }">
                 <div class="segment-meta">
                   <span class="segment-number">{{ index + 1 }}</span>
                   <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
                 </div>
-                <span class="transcribing-segment">⏳ Transcribing...</span>
+                <span class="transcribing-segment">
+                  <span style="margin-right: 4px;">⌛</span>
+                  Transcribing...
+                </span>
               </div>
-              <div v-else-if="segment.transcriptionError" class="segment-container error">
+              <div v-else-if="segment.transcriptionError" class="segment-container error" :class="{ 'highlighted': currentHighlightedSegment === index }">
                 <div class="segment-meta">
                   <span class="segment-number">{{ index + 1 }}</span>
                   <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
                 </div>
-                <span class="error-segment" :title="`Error: ${segment.transcriptionError}`">❌ Error</span>
+                <span class="error-segment" :title="`Error: ${segment.transcriptionError}`">
+                  <span style="margin-right: 4px;">⚠</span>
+                  Error
+                </span>
               </div>
-              <div v-else class="segment-container processing">
+              <div v-else class="segment-container processing" :class="{ 'highlighted': currentHighlightedSegment === index }">
                 <div class="segment-meta">
                   <span class="segment-number">{{ index + 1 }}</span>
                   <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
                 </div>
-                <span class="processing-segment">⏳ Processing...</span>
+                <span class="processing-segment">
+                  Processing...
+                </span>
               </div>
             </div>
           </div>
         </div>
       </div>
     </div>
+    
+    <!-- Fixed Audio Player -->
+    <div v-if="showAudioPlayer && originalAudioBase64" class="audio-player-container">
+      <div class="audio-player">
+        <div class="audio-info-section">
+          <div class="audio-icon-wrapper">
+            <div class="audio-icon">♪</div>
+            <div class="audio-visualizer">
+              <div class="bar" :class="{ active: isPlaying }"></div>
+              <div class="bar" :class="{ active: isPlaying }"></div>
+              <div class="bar" :class="{ active: isPlaying }"></div>
+              <div class="bar" :class="{ active: isPlaying }"></div>
+            </div>
+          </div>
+          <div class="audio-details">
+            <div class="audio-title">{{ audioFile?.name || projectName }}</div>
+            <div class="audio-subtitle">
+              {{ currentHighlightedSegment >= 0 ? `Playing segment ${currentHighlightedSegment + 1}` : 'Ready to play' }}
+            </div>
+          </div>
+        </div>
+        
+        <div class="audio-controls-section">
+          <div class="main-controls">
+            <button @click="jumpToPreviousSegment" class="control-button secondary" title="Previous segment">
+              <span class="control-icon">⏮</span>
+            </button>
+            <button @click="togglePlayPause" class="control-button primary" title="Play/Pause">
+              <span class="control-icon">{{ isPlaying ? '⏸' : '▶' }}</span>
+            </button>
+            <button @click="jumpToNextSegment" class="control-button secondary" title="Next segment">
+              <span class="control-icon">⏭</span>
+            </button>
+          </div>
+          
+          <div class="progress-section">
+            <span class="time-display">{{ formatTime(currentTime) }}</span>
+            <div class="progress-container">
+              <div class="progress-track">
+                <div class="progress-fill" :style="{ width: `${(currentTime / duration) * 100}%` }"></div>
+                <input 
+                  type="range" 
+                  min="0" 
+                  :max="duration || 100" 
+                  :value="currentTime" 
+                  @input="handleSliderChange"
+                  class="progress-slider"
+                />
+              </div>
+            </div>
+            <span class="time-display">{{ formatTime(duration) }}</span>
+          </div>
+        </div>
+        
+      </div>
+    </div>
   </main>
+
+  <!-- Settings Modal -->
+  <div v-if="showSettings" class="modal-overlay" @click="showSettings = false">
+    <div class="modal-content" @click.stop>
+      <div class="modal-header">
+        <h3>Settings</h3>
+        <button class="close-button" @click="showSettings = false">×</button>
+      </div>
+      
+      <div class="modal-body">
+        <div class="setting-group">
+          <label for="api-key">API Key:</label>
+          <input 
+            id="api-key" 
+            v-model="apiKey" 
+            type="password" 
+            placeholder="Enter your API key"
+            class="setting-input"
+          />
+        </div>
+        
+        <div class="setting-group">
+          <label for="base-url">Base URL:</label>
+          <input 
+            id="base-url" 
+            v-model="baseUrl" 
+            type="url" 
+            placeholder="Enter the API base URL"
+            class="setting-input"
+          />
+        </div>
+        
+        <div class="setting-group">
+          <label for="model-name">Model Name:</label>
+          <input 
+            id="model-name" 
+            v-model="modelName" 
+            type="text" 
+            placeholder="Enter the model name"
+            class="setting-input"
+          />
+        </div>
+      </div>
+      
+      <div class="modal-footer">
+        <button @click="resetSettings" class="button secondary">Reset to Defaults</button>
+        <button @click="saveSettings" class="button primary">Save Settings</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
@@ -822,9 +1244,16 @@ function copyAll() {
 }
 
 .menu-icon {
-  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 16px;
   text-align: center;
+}
+
+.menu-icon svg {
+  width: 14px;
+  height: 14px;
 }
 
 .menu-shortcut {
@@ -898,7 +1327,15 @@ function copyAll() {
 }
 
 .spinner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   animation: spin 1s linear infinite;
+}
+
+.spinner svg {
+  width: 100%;
+  height: 100%;
 }
 
 @keyframes spin {
@@ -906,10 +1343,26 @@ function copyAll() {
   to { transform: rotate(360deg); }
 }
 
+@keyframes pulse {
+  0% { 
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(33, 150, 243, 0.4);
+  }
+  70% {
+    transform: scale(1.05);
+    box-shadow: 0 0 0 8px rgba(33, 150, 243, 0);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(33, 150, 243, 0);
+  }
+}
+
 /* Main Content */
 .main-content {
   flex: 1;
   padding: 20px;
+  padding-bottom: 300px;
 }
 
 .processing-section {
@@ -921,41 +1374,195 @@ function copyAll() {
 
 .processing-card {
   background: white;
-  padding: 40px;
-  border-radius: 12px;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.1);
-  text-align: center;
-  max-width: 400px;
-  border-left: 4px solid #ff9800;
+  padding: 32px;
+  border-radius: 16px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+  text-align: left;
+  max-width: 500px;
+  border-left: 4px solid #2196f3;
+  min-width: 450px;
+}
+
+.processing-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 24px;
 }
 
 .processing-spinner {
-  font-size: 48px;
+  font-size: 32px;
   animation: spin 1s linear infinite;
-  margin-bottom: 16px;
+  flex-shrink: 0;
 }
 
 .processing-card h3 {
-  margin: 0 0 16px 0;
+  margin: 0;
   color: #333;
   font-size: 24px;
   font-weight: 600;
 }
 
-.processing-card p {
-  margin: 0 0 20px 0;
-  color: #666;
-  font-size: 16px;
+.progress-section {
+  margin-bottom: 24px;
 }
 
-.processing-steps {
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.progress-text {
+  color: #666;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.progress-percentage {
+  color: #2196f3;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.progress-bar-container {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  background: #f0f0f0;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-bar-track {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #2196f3, #21cbf3);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.progress-bar-fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  right: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+  animation: shimmer 2s infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.file-info {
   background: #f8f9fa;
   padding: 16px;
   border-radius: 8px;
-  text-align: left;
-  color: #666;
+  margin-bottom: 24px;
+}
+
+.file-details {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.file-icon {
+  font-size: 24px;
+  color: #2196f3;
+  flex-shrink: 0;
+}
+
+.file-text {
+  flex: 1;
+}
+
+.file-name {
+  font-weight: 500;
+  color: #333;
   font-size: 14px;
-  line-height: 1.6;
+  margin-bottom: 2px;
+}
+
+.file-size {
+  color: #666;
+  font-size: 12px;
+}
+
+.processing-steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.processing-step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  transition: all 0.3s ease;
+}
+
+.processing-step.completed {
+  color: #4caf50;
+}
+
+.processing-step.active {
+  color: #2196f3;
+  font-weight: 500;
+}
+
+.processing-step.pending {
+  color: #999;
+}
+
+.step-indicator {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: bold;
+  flex-shrink: 0;
+  transition: all 0.3s ease;
+}
+
+.processing-step.completed .step-indicator {
+  background: #4caf50;
+  color: white;
+}
+
+.processing-step.active .step-indicator {
+  background: #2196f3;
+  color: white;
+  animation: pulse 1.5s infinite;
+}
+
+.processing-step.pending .step-indicator {
+  background: #e0e0e0;
+  color: #999;
+}
+
+.step-text {
+  font-size: 14px;
+}
+
+.step-spinner {
+  animation: spin 1s linear infinite;
 }
 
 .upload-section {
@@ -1049,6 +1656,24 @@ function copyAll() {
   gap: 1rem;
   padding: 0.75rem 1rem;
   transition: background-color 0.2s ease;
+}
+
+.segment-container.highlighted {
+  background-color: #e3f2fd !important;
+  border-left: 4px solid #1976d2;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% { 
+    box-shadow: 0 0 0 0 rgba(25, 118, 210, 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(25, 118, 210, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(25, 118, 210, 0);
+  }
 }
 
 .segment-container:hover {
@@ -1145,6 +1770,399 @@ function copyAll() {
 button:disabled {
   background-color: #cccccc;
   cursor: not-allowed;
+}
+
+/* Fixed Audio Player */
+.audio-player-container {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.95));
+  backdrop-filter: blur(20px);
+  z-index: 2000;
+  padding: 16px 24px;
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.4);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.audio-player {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  max-width: 1400px;
+  margin: 0 auto;
+  color: white;
+}
+
+.audio-info-section {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 280px;
+  flex-shrink: 0;
+}
+
+.audio-icon-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  border-radius: 16px;
+  box-shadow: 0 4px 16px rgba(59, 130, 246, 0.3);
+}
+
+.audio-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  z-index: 1;
+}
+
+.audio-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
+.audio-visualizer {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  display: flex;
+  gap: 2px;
+  align-items: end;
+}
+
+.audio-visualizer .bar {
+  width: 2px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.4);
+  border-radius: 1px;
+  transition: all 0.3s ease;
+}
+
+.audio-visualizer .bar.active {
+  animation: visualize 1.5s ease-in-out infinite;
+}
+
+.audio-visualizer .bar:nth-child(1).active { animation-delay: 0s; }
+.audio-visualizer .bar:nth-child(2).active { animation-delay: 0.1s; }
+.audio-visualizer .bar:nth-child(3).active { animation-delay: 0.2s; }
+.audio-visualizer .bar:nth-child(4).active { animation-delay: 0.3s; }
+
+@keyframes visualize {
+  0%, 100% { 
+    height: 4px; 
+    background: rgba(255, 255, 255, 0.4);
+  }
+  50% { 
+    height: 12px; 
+    background: rgba(255, 255, 255, 0.9);
+  }
+}
+
+.audio-details {
+  flex: 1;
+  min-width: 0;
+  max-width: 300px; /* Ensure a maximum width for proper ellipsis */
+}
+
+.audio-title {
+  font-weight: 600;
+  font-size: 16px;
+  color: white;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+  line-height: 1.2;
+  max-width: 100%; /* Ensure title respects parent width */
+}
+
+.audio-subtitle {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 400;
+}
+
+.audio-controls-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.main-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 16px;
+}
+
+.control-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-size: 16px;
+  position: relative;
+  overflow: hidden;
+}
+
+.control-button.primary {
+  width: 56px;
+  height: 56px;
+  background: linear-gradient(135deg, #10b981, #059669);
+  box-shadow: 0 4px 16px rgba(16, 185, 129, 0.3);
+}
+
+.control-button.primary:hover {
+  transform: scale(1.05);
+  box-shadow: 0 6px 20px rgba(16, 185, 129, 0.4);
+}
+
+.control-button.secondary {
+  width: 44px;
+  height: 44px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.control-button.secondary:hover {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.3);
+  transform: translateY(-1px);
+}
+
+.control-button.tertiary {
+  width: 40px;
+  height: 40px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.control-button.tertiary:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.control-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-size: inherit;
+}
+
+.control-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.progress-section {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.time-display {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.8);
+  font-family: 'SF Mono', Consolas, 'Monaco', monospace;
+  font-weight: 500;
+  min-width: 50px;
+  text-align: center;
+}
+
+.progress-container {
+  flex: 1;
+  min-width: 200px;
+}
+
+.progress-track {
+  position: relative;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #1d4ed8);
+  border-radius: 4px;
+  transition: width 0.1s ease;
+  position: relative;
+}
+
+.progress-fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 3px;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.8);
+  border-radius: 0 4px 4px 0;
+}
+
+.progress-slider {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  z-index: 1;
+}
+
+.progress-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  background: white;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  border: 2px solid #3b82f6;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.progress-slider:hover::-webkit-slider-thumb,
+.progress-slider:active::-webkit-slider-thumb {
+  opacity: 1;
+}
+
+.progress-slider::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  background: white;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid #3b82f6;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.progress-slider:hover::-moz-range-thumb,
+.progress-slider:active::-moz-range-thumb {
+  opacity: 1;
+}
+
+.audio-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 120px;
+  justify-content: flex-end;
+}
+
+.volume-indicator {
+  display: flex;
+  gap: 3px;
+  align-items: end;
+  height: 24px;
+}
+
+.volume-bar {
+  width: 3px;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.3);
+  border-radius: 2px;
+  transition: all 0.3s ease;
+}
+
+.volume-indicator.active .volume-bar {
+  animation: volumePulse 1.2s ease-in-out infinite;
+}
+
+.volume-indicator.active .volume-bar:nth-child(1) { animation-delay: 0s; }
+.volume-indicator.active .volume-bar:nth-child(2) { animation-delay: 0.15s; }
+.volume-indicator.active .volume-bar:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes volumePulse {
+  0%, 100% { 
+    height: 8px; 
+    background: rgba(255, 255, 255, 0.3);
+  }
+  50% { 
+    height: 18px; 
+    background: rgba(255, 255, 255, 0.8);
+  }
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+  .audio-player {
+    flex-direction: column;
+    gap: 16px;
+  }
+  
+  .audio-info-section {
+    min-width: auto;
+    width: 100%;
+    justify-content: center;
+  }
+  
+  .audio-details {
+    max-width: 100%;
+    min-width: 0;
+  }
+  
+  .audio-title {
+    max-width: 250px; /* Smaller max width on mobile */
+  }
+  
+  .audio-controls-section {
+    width: 100%;
+  }
+  
+  .audio-actions {
+    min-width: auto;
+    justify-content: center;
+  }
+  
+  .progress-section {
+    flex-direction: column;
+    gap: 8px;
+  }
+  
+  .time-display {
+    order: -1;
+  }
+}
+
+/* Focus styles for accessibility */
+.control-button:focus {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.progress-slider:focus {
+  outline: none;
+}
+
+.progress-slider:focus + .progress-track {
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
 }
 </style>
 <style>
@@ -1257,6 +2275,178 @@ button {
 
 body {
   margin: 0;
+  overscroll-behavior: none;
+}
+
+/* Modal Styles */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+  max-width: 500px;
+  width: 90%;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.close-button {
+  background: none;
+  border: none;
+  font-size: 24px;
+  cursor: pointer;
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: #666;
+}
+
+.close-button:hover {
+  background: #f0f0f0;
+  color: #333;
+}
+
+.modal-body {
+  padding: 24px;
+}
+
+.setting-group {
+  margin-bottom: 20px;
+}
+
+.setting-group label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 500;
+  color: #333;
+}
+
+.setting-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 2px solid #e0e0e0;
+  border-radius: 6px;
+  font-size: 14px;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+}
+
+.setting-input:focus {
+  border-color: #007AFF;
+  outline: none;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 16px 24px 24px;
+  border-top: 1px solid #e0e0e0;
+}
+
+.button {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.button.primary {
+  background: #007AFF;
+  color: white;
+}
+
+.button.primary:hover {
+  background: #0056CC;
+}
+
+.button.secondary {
+  background: #f0f0f0;
+  color: #333;
+}
+
+.button.secondary:hover {
+  background: #e0e0e0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .modal-content {
+    background: #2d2d2d;
+    color: #f6f6f6;
+  }
+  
+  .modal-header {
+    border-bottom-color: #444;
+  }
+  
+  .modal-footer {
+    border-top-color: #444;
+  }
+  
+  .close-button {
+    color: #ccc;
+  }
+  
+  .close-button:hover {
+    background: #444;
+    color: #fff;
+  }
+  
+  .setting-group label {
+    color: #f6f6f6;
+  }
+  
+  .setting-input {
+    background: #3d3d3d;
+    border-color: #555;
+    color: #f6f6f6;
+  }
+  
+  .setting-input:focus {
+    border-color: #007AFF;
+  }
+  
+  .button.secondary {
+    background: #444;
+    color: #f6f6f6;
+  }
+  
+  .button.secondary:hover {
+    background: #555;
+  }
 }
 
 </style>

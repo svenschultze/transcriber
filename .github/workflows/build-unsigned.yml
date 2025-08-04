@@ -1,0 +1,83 @@
+name: Build (Unsigned)
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: macos-latest
+            platform: macos-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Node.js (for npm dependencies)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli@latest
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Tauri app
+        run: npm run tauri build -- --no-bundle
+
+      - name: Upload Windows artifacts
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcriber-windows-unsigned
+          path: |
+            src-tauri/target/release/transcriber.exe
+
+      - name: Upload macOS artifacts
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcriber-macos-unsigned
+          path: |
+            src-tauri/target/release/transcriber

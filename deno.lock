@@ -499,6 +499,11 @@
     }
   },
   "workspace": {
+    "dependencies": [
+      "npm:@tauri-apps/api@2",
+      "npm:@tauri-apps/plugin-opener@2",
+      "npm:vue@^3.5.13"
+    ],
     "packageJson": {
       "dependencies": [
         "npm:@tauri-apps/api@2",

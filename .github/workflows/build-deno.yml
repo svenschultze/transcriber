@@ -1,0 +1,110 @@
+name: Build with Deno
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Check TypeScript
+        run: deno check src/main.ts
+
+      - name: Run Deno lint
+        run: deno lint src/
+
+      - name: Run Deno format check
+        run: deno fmt --check src/
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            ext: .exe
+          - os: macos-latest
+            platform: macos-x86_64
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Node.js (for npm dependencies)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Tauri CLI via Deno
+        run: deno install --allow-read --allow-write --allow-net --allow-run --allow-env -n tauri https://deno.land/x/tauri_cli/mod.ts || npm install -g @tauri-apps/cli@latest
+
+      - name: Build frontend with Deno
+        run: deno task build || npm run build
+
+      - name: Build Tauri app
+        run: npm run tauri build
+
+      - name: Upload Windows artifacts
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcriber-windows-deno
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/transcriber.exe
+
+      - name: Upload macOS artifacts
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcriber-macos-deno
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/transcriber

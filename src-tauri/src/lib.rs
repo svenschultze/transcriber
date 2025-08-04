@@ -5,6 +5,15 @@ mod utils;
 mod vad_iter;
 
 use audio_processing::{AudioProcessor, AudioSegment};
+use serde::{Serialize, Deserialize};
+use tauri::Emitter;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProgressUpdate {
+    pub step: String,
+    pub progress: f64, // 0.0 to 100.0
+    pub details: Option<String>,
+}
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -46,28 +55,47 @@ async fn select_audio_file() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn process_audio_vad(file_path: String) -> Result<Vec<AudioSegment>, String> {
+async fn process_audio_vad(file_path: String, app_handle: tauri::AppHandle) -> Result<Vec<AudioSegment>, String> {
     // Check if file exists
     if !std::path::Path::new(&file_path).exists() {
         return Err(format!("File not found: {}", file_path));
     }
 
-    // Process the audio file directly - no fallbacks
+    // Create a progress callback
+    let progress_callback = |step: &str, progress: f64, details: Option<&str>| {
+        let update = ProgressUpdate {
+            step: step.to_string(),
+            progress,
+            details: details.map(|s| s.to_string()),
+        };
+        
+        // Emit progress event
+        if let Err(e) = app_handle.emit("audio-processing-progress", &update) {
+            eprintln!("Failed to emit progress event: {}", e);
+        }
+    };
+
+    // Process the audio file with progress reporting
     let mut processor = AudioProcessor::new();
     
-    match processor.process_audio_file(&file_path, "mock_model_path") {
-        Ok(segments) => Ok(segments),
+    match processor.process_audio_file_with_progress(&file_path, "mock_model_path", progress_callback) {
+        Ok(segments) => {
+            // Final progress update
+            progress_callback("Processing complete", 100.0, Some(&format!("Found {} speech segments", segments.len())));
+            Ok(segments)
+        },
         Err(e) => Err(format!("Error processing audio file: {}", e))
     }
 }
 
 #[tauri::command]
-async fn transcribe_audio(audio_base64: String, segment_index: usize) -> Result<String, String> {
-    // Static API configuration
-    const API_KEY: &str = "sk-Uyd5NxnfGjQR-S7UN2eJGQ";
-    const BASE_URL: &str = "https://api.litviva.com/v1";
-    const MODEL: &str = "hackathon/speech2text";
-    
+async fn transcribe_audio(
+    audio_base64: String, 
+    segment_index: usize,
+    api_key: String,
+    base_url: String,
+    model_name: String
+) -> Result<String, String> {
     // Decode base64 to bytes
     let audio_bytes = base64::decode(&audio_base64)
         .map_err(|e| format!("Failed to decode base64: {}", e))?;
@@ -78,7 +106,7 @@ async fn transcribe_audio(audio_base64: String, segment_index: usize) -> Result<
             .file_name(format!("segment_{}.wav", segment_index))
             .mime_str("audio/wav")
             .map_err(|e| format!("Failed to set mime type: {}", e))?)
-        .text("model", MODEL);
+        .text("model", model_name);
         //.text("language", "en");
     
     // Create HTTP client
@@ -86,8 +114,8 @@ async fn transcribe_audio(audio_base64: String, segment_index: usize) -> Result<
     
     // Make the API request
     let response = client
-        .post(&format!("{}/audio/transcriptions", BASE_URL))
-        .header("Authorization", format!("Bearer {}", API_KEY))
+        .post(&format!("{}/audio/transcriptions", base_url))
+        .header("Authorization", format!("Bearer {}", api_key))
         .multipart(form)
         .send()
         .await

@@ -32,6 +32,14 @@ impl AudioProcessor {
 
     // Decode audio using Symphonia (supports MP3, WAV, FLAC, etc.)
     fn decode_audio_symphonia(&self, file_path: &str) -> Result<(Vec<i16>, u32), Box<dyn std::error::Error>> {
+        let dummy_callback = |_step: &str, _progress: f64, _details: Option<&str>| {};
+        self.decode_audio_symphonia_with_progress(file_path, &dummy_callback)
+    }
+
+    fn decode_audio_symphonia_with_progress<F>(&self, file_path: &str, progress_callback: &F) -> Result<(Vec<i16>, u32), Box<dyn std::error::Error>>
+    where
+        F: Fn(&str, f64, Option<&str>),
+    {
         let file = File::open(file_path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -63,6 +71,8 @@ impl AudioProcessor {
 
         let mut samples = Vec::new();
         let mut sample_buf = None;
+        let mut packet_count = 0;
+        let estimated_packets = 1000; // Rough estimate for progress tracking
 
         loop {
             let packet = match format.next_packet() {
@@ -81,6 +91,14 @@ impl AudioProcessor {
 
             if packet.track_id() != track_id {
                 continue;
+            }
+
+            packet_count += 1;
+            
+            // Update progress every 50 packets
+            if packet_count % 50 == 0 {
+                let decode_progress = 10.0 + (packet_count as f64 / estimated_packets as f64) * 15.0;
+                progress_callback("Decoding audio packets", decode_progress.min(24.0), Some(&format!("Processed {} packets", packet_count)));
             }
 
             match decoder.decode(&packet) {
@@ -123,6 +141,15 @@ impl AudioProcessor {
     }
 
     pub fn process_audio_file(&mut self, file_path: &str, _model_path: &str) -> Result<Vec<AudioSegment>, Box<dyn std::error::Error>> {
+        // Default progress callback that does nothing
+        let dummy_callback = |_step: &str, _progress: f64, _details: Option<&str>| {};
+        self.process_audio_file_with_progress(file_path, _model_path, dummy_callback)
+    }
+
+    pub fn process_audio_file_with_progress<F>(&mut self, file_path: &str, _model_path: &str, progress_callback: F) -> Result<Vec<AudioSegment>, Box<dyn std::error::Error>>
+    where
+        F: Fn(&str, f64, Option<&str>),
+    {
         // Check file extension to provide better error messages
         let path = std::path::Path::new(file_path);
         let extension = path.extension()
@@ -131,6 +158,7 @@ impl AudioProcessor {
             .to_lowercase();
         
         println!("Processing audio file: {} (format: {})", file_path, extension);
+        progress_callback("Validating file format", 5.0, Some(&format!("Detected format: {}", extension)));
         
         // Support multiple audio formats now
         match extension.as_str() {
@@ -143,13 +171,15 @@ impl AudioProcessor {
         }
         
         // Decode audio using Symphonia
-        let (mut content, original_sample_rate) = self.decode_audio_symphonia(file_path)?;
+        progress_callback("Decoding audio file", 10.0, Some("Reading and decoding audio data"));
+        let (mut content, original_sample_rate) = self.decode_audio_symphonia_with_progress(file_path, &progress_callback)?;
         
         // Always target 16kHz for VAD processing
         let target_sample_rate = utils::SampleRate::SixteenkHz;
         let target_rate_hz = 16000u32;
         
         println!("Processing audio file: {} Hz -> {} Hz", original_sample_rate, target_rate_hz);
+        progress_callback("Audio decoded", 25.0, Some(&format!("{} samples at {} Hz", content.len(), original_sample_rate)));
         
         self.sample_rate = target_sample_rate;
 
@@ -161,12 +191,15 @@ impl AudioProcessor {
 
         // Resample to 16kHz if needed
         if original_sample_rate != target_rate_hz {
+            progress_callback("Resampling audio", 35.0, Some(&format!("Converting from {} Hz to {} Hz", original_sample_rate, target_rate_hz)));
             content = self.simple_resample(&content, original_sample_rate, target_rate_hz);
             println!("Resampled to: {} samples at {} Hz", content.len(), target_rate_hz);
+            progress_callback("Audio resampled", 45.0, Some(&format!("{} samples at {} Hz", content.len(), target_rate_hz)));
         }
 
         // Use real Silero VAD through voice_activity_detector crate
         println!("Running voice activity detection...");
+        progress_callback("Running voice activity detection", 50.0, Some("Initializing AI voice detection"));
         
         // According to the docs, 16kHz sample rate requires 512-sample chunks
         let chunk_size = 512usize;
@@ -179,12 +212,17 @@ impl AudioProcessor {
         // Use the label iterator with threshold 0.5 and 2 chunks padding
         let threshold = 0.5;
         let padding_chunks = 2;
+        
+        progress_callback("Analyzing speech patterns", 60.0, Some("Processing audio chunks for speech detection"));
         let labels: Vec<_> = content.iter().cloned().label(&mut vad, threshold, padding_chunks).collect();
+        progress_callback("Speech detection complete", 75.0, Some(&format!("Processed {} audio chunks", labels.len())));
         
         // Convert labeled chunks back to continuous segments
         let mut segments = Vec::new();
         let mut current_speech_start = None;
         let sample_rate_f64 = 16000.0; // We know it's 16kHz after resampling
+        
+        progress_callback("Extracting speech segments", 80.0, Some("Converting detection results to segments"));
         
         for (chunk_index, label) in labels.iter().enumerate() {
             let chunk_start_sample = chunk_index * chunk_size;
@@ -252,17 +290,27 @@ impl AudioProcessor {
         }
 
         println!("Generated {} initial speech segments using Silero VAD", segments.len());
+        progress_callback("Optimizing segments", 90.0, Some(&format!("Found {} initial segments", segments.len())));
 
         // Merge segments that are close together (within 3 seconds)
-        let merged_segments = self.merge_close_segments(segments, &content, 1.5);
+        let merged_segments = self.merge_close_segments_with_progress(segments, &content, 1.5, &progress_callback);
         
         println!("After merging close segments: {} final segments", merged_segments.len());
+        progress_callback("Segmentation complete", 95.0, Some(&format!("Optimized to {} final segments", merged_segments.len())));
 
         Ok(merged_segments)
     }
 
     // Merge segments that are close together (within max_gap_seconds)
     fn merge_close_segments(&self, mut segments: Vec<AudioSegment>, content: &[i16], max_gap_seconds: f64) -> Vec<AudioSegment> {
+        let dummy_callback = |_step: &str, _progress: f64, _details: Option<&str>| {};
+        self.merge_close_segments_with_progress(segments, content, max_gap_seconds, &dummy_callback)
+    }
+
+    fn merge_close_segments_with_progress<F>(&self, mut segments: Vec<AudioSegment>, content: &[i16], max_gap_seconds: f64, progress_callback: &F) -> Vec<AudioSegment>
+    where
+        F: Fn(&str, f64, Option<&str>),
+    {
         if segments.is_empty() {
             return segments;
         }
@@ -273,8 +321,18 @@ impl AudioProcessor {
         let mut merged = Vec::new();
         let mut segments_iter = segments.into_iter();
         let mut current = segments_iter.next().unwrap();
+        let mut processed = 0;
+        let total_segments = segments_iter.len() + 1;
 
         for next in segments_iter {
+            processed += 1;
+            
+            // Update progress during merging
+            if processed % 10 == 0 || processed == total_segments - 1 {
+                let merge_progress = 90.0 + (processed as f64 / total_segments as f64) * 5.0;
+                progress_callback("Merging segments", merge_progress, Some(&format!("Processed {}/{} segments", processed, total_segments)));
+            }
+            
             let gap = next.start_time_seconds - current.end_time_seconds;
             
             if gap <= max_gap_seconds {
