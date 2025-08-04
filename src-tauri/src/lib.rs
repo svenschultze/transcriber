@@ -1,8 +1,6 @@
 // Modules
 mod audio_processing;
-mod silero;
 mod utils;
-mod vad_iter;
 
 use audio_processing::{AudioProcessor, AudioSegment};
 use serde::{Serialize, Deserialize};
