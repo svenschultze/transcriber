@@ -8,18 +8,19 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-unsigned:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
         include:
-          - os: windows-latest
-            platform: windows-x86_64
-          - os: macos-latest
-            platform: macos-x86_64
+          - platform: 'macos-latest'
+            args: '--target aarch64-apple-darwin'
+          - platform: 'macos-latest'
+            args: '--target x86_64-apple-darwin'
+          - platform: 'windows-latest'
+            args: ''
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Checkout repository
@@ -34,50 +35,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            src-tauri/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Install Node.js (for npm dependencies)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Install Tauri CLI
-        run: npm install -g @tauri-apps/cli@latest
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Build frontend
-        run: npm run build
+        run: deno task build
 
-      - name: Build Tauri app
-        run: npm run tauri build -- --no-bundle
-
-      - name: Upload Windows artifacts
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+      - uses: tauri-apps/tauri-action@v0
         with:
-          name: transcriber-windows-unsigned
-          path: |
-            src-tauri/target/release/transcriber.exe
-
-      - name: Upload macOS artifacts
-        if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: transcriber-macos-unsigned
-          path: |
-            src-tauri/target/release/transcriber
+          args: ${{ matrix.args }}
+          tauriScript: deno task tauri
