@@ -244,13 +244,21 @@ async fn transcribe_audio(
     Ok(text)
 }
 
+#[tauri::command]
+async fn check_file_exists(file_path: String) -> Result<bool, String> {
+    use std::path::Path;
+    
+    let path = Path::new(&file_path);
+    Ok(path.exists() && path.is_file())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![greet, process_audio_vad, select_audio_file, save_audio_file, save_audio_file_chunked, transcribe_audio, convert_audio_to_base64])
+        .invoke_handler(tauri::generate_handler![greet, process_audio_vad, select_audio_file, save_audio_file, save_audio_file_chunked, transcribe_audio, convert_audio_to_base64, check_file_exists])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
