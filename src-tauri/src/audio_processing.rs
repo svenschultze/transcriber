@@ -31,7 +31,7 @@ impl AudioProcessor {
     }
 
     // Decode audio using Symphonia (supports MP3, WAV, FLAC, etc.)
-    fn decode_audio_symphonia(&self, file_path: &str) -> Result<(Vec<i16>, u32), Box<dyn std::error::Error>> {
+    pub fn decode_audio_symphonia(&self, file_path: &str) -> Result<(Vec<i16>, u32), Box<dyn std::error::Error>> {
         let dummy_callback = |_step: &str, _progress: f64, _details: Option<&str>| {};
         self.decode_audio_symphonia_with_progress(file_path, &dummy_callback)
     }
@@ -460,5 +460,47 @@ impl AudioProcessor {
         }
         
         output
+    }
+    
+    /// Public wrapper for resampling audio
+    pub fn resample_audio(&self, input: &[i16], from_rate: u32, to_rate: u32) -> Result<Vec<i16>, Box<dyn std::error::Error>> {
+        Ok(self.simple_resample(input, from_rate, to_rate))
+    }
+    
+    /// Convert audio samples to WAV bytes (without base64 encoding)
+    pub fn samples_to_wav_bytes(&self, samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut wav_data = Vec::new();
+        
+        // WAV header
+        let num_samples = samples.len() as u32;
+        let byte_rate = sample_rate * 2; // 16-bit mono
+        let data_size = num_samples * 2;
+        let file_size = 36 + data_size;
+        
+        // RIFF header
+        wav_data.extend_from_slice(b"RIFF");
+        wav_data.extend_from_slice(&file_size.to_le_bytes());
+        wav_data.extend_from_slice(b"WAVE");
+        
+        // fmt chunk
+        wav_data.extend_from_slice(b"fmt ");
+        wav_data.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+        wav_data.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+        wav_data.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav_data.extend_from_slice(&sample_rate.to_le_bytes());
+        wav_data.extend_from_slice(&byte_rate.to_le_bytes());
+        wav_data.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav_data.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        
+        // data chunk
+        wav_data.extend_from_slice(b"data");
+        wav_data.extend_from_slice(&data_size.to_le_bytes());
+        
+        // audio data
+        for &sample in samples {
+            wav_data.extend_from_slice(&sample.to_le_bytes());
+        }
+        
+        Ok(wav_data)
     }
 }

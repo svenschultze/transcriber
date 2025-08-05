@@ -157,35 +157,56 @@ async function processAudio() {
   processingStep.value = "Preparing audio file...";
 
   try {
-    // Frontend preparation steps (quick operations)
-    processingStep.value = "Reading audio file...";
+    // Use chunked upload to avoid JavaScript memory limits with large files
+    processingStep.value = "Preparing audio file...";
     processingProgress.value = 2;
     
-    const arrayBuffer = await audioFile.value.arrayBuffer();
-    const bytes = Array.from(new Uint8Array(arrayBuffer));
+    // Generate a unique session ID for this upload
+    const sessionId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
     
-    processingStep.value = "Encoding audio for playback...";
+    // Read file in chunks to avoid memory issues
+    const file = audioFile.value;
+    const chunkSize = 1024 * 1024; // 1MB chunks
+    const totalChunks = Math.ceil(file.size / chunkSize);
+    
+    processingStep.value = `Uploading file (0/${totalChunks} chunks)...`;
     processingProgress.value = 5;
     
-    const uint8Array = new Uint8Array(arrayBuffer);
-    let binaryString = '';
-    const chunkSize = 8192;
+    let tempFilePath = "";
     
-    for (let i = 0; i < uint8Array.length; i += chunkSize) {
-      const chunk = uint8Array.slice(i, i + chunkSize);
-      binaryString += String.fromCharCode.apply(null, Array.from(chunk));
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * chunkSize;
+      const end = Math.min(start + chunkSize, file.size);
+      const chunk = file.slice(start, end);
+      const chunkArrayBuffer = await chunk.arrayBuffer();
+      const chunkBytes = Array.from(new Uint8Array(chunkArrayBuffer));
+      
+      processingStep.value = `Uploading file (${chunkIndex + 1}/${totalChunks} chunks)...`;
+      processingProgress.value = 5 + (chunkIndex / totalChunks) * 3; // 5-8% for upload
+      
+      const result = await invoke("save_audio_file_chunked", {
+        chunkData: chunkBytes,
+        chunkIndex: chunkIndex,
+        totalChunks: totalChunks,
+        filename: file.name,
+        sessionId: sessionId
+      });
+      
+      // The last chunk returns the final file path
+      if (chunkIndex === totalChunks - 1) {
+        tempFilePath = result as string;
+      }
     }
     
-    originalAudioBase64.value = btoa(binaryString);
-    createAudioPlayer();
-    
-    processingStep.value = "Saving audio file...";
+    processingStep.value = "Preparing audio for playback...";
     processingProgress.value = 8;
     
-    const tempFilePath = await invoke("save_audio_file", { 
-      fileData: bytes, 
-      filename: audioFile.value.name 
-    });
+    // Convert audio to base64 in the backend (handles large files better)
+    originalAudioBase64.value = await invoke("convert_audio_to_base64", { 
+      filePath: tempFilePath 
+    }) as string;
+    
+    createAudioPlayer();
     
     // Backend processing with real progress events
     processingStep.value = "Initializing audio processing...";
