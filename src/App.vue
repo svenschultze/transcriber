@@ -23,6 +23,12 @@ const duration = ref(0);
 const isPlaying = ref(false);
 const currentHighlightedSegment = ref<number>(-1);
 
+// Noscribe import state
+const showAudioWarning = ref(false);
+const missingAudioPath = ref("");
+const audioLoadingProgress = ref(0);
+const isLoadingAudio = ref(false);
+
 // Settings
 const showSettings = ref(false);
 const apiKey = ref("sk-...");
@@ -122,6 +128,279 @@ function resetSettings() {
   modelName.value = "whisper-1";
 }
 
+// Noscribe HTML import function
+async function importNoscribeFile(event: Event) {
+  const target = event.target as HTMLInputElement;
+  if (!target.files || target.files.length === 0) return;
+  
+  const htmlFile = target.files[0];
+  
+  try {
+    // Read the HTML file content
+    const htmlContent = await htmlFile.text();
+    
+    // Parse the HTML
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(htmlContent, 'text/html');
+    
+    // Extract audio source from meta tag
+    const audioSourceMeta = doc.querySelector('meta[name="audio_source"]');
+    const audioSourcePath = audioSourceMeta?.getAttribute('content');
+    
+    if (!audioSourcePath) {
+      errorMsg.value = "No audio source found in the HTML file";
+      return;
+    }
+    
+    // Extract transcript content from the body
+    const bodyContent = doc.body;
+    const segments = parseNoscribeTranscript(bodyContent);
+    
+    // Set project name from filename
+    const fileName = htmlFile.name;
+    const nameWithoutExtension = fileName.substring(0, fileName.lastIndexOf('.')) || fileName;
+    projectName.value = nameWithoutExtension;
+    
+    // Clear current data
+    vadResults.value = [];
+    originalAudioBase64.value = "";
+    audioFile.value = null;
+    
+    // Set the extracted segments
+    vadResults.value = segments;
+    
+    transcriptionStatus.value = `Imported ${segments.length} segments from noscribe file.`;
+    
+    // Try to load the audio file automatically first
+    await tryLoadAudioFile(audioSourcePath);
+    
+  } catch (error) {
+    errorMsg.value = `Error importing noscribe file: ${error}`;
+    console.error("Import error:", error);
+  }
+  
+  // Clear the input
+  target.value = '';
+}
+
+async function tryLoadAudioFile(audioPath: string) {
+  try {
+    // First, try to check if the file exists using Tauri's file system API
+    const fileExists = await invoke('check_file_exists', { filePath: audioPath });
+    
+    if (fileExists) {
+      // File exists, try to load it
+      transcriptionStatus.value = "Loading referenced audio file...";
+      
+      try {
+        // Use the chunked file processing to load the existing file
+        const result = await invoke('convert_audio_to_base64', {
+          filePath: audioPath,
+        });
+        
+        if (typeof result === 'string') {
+          originalAudioBase64.value = result;
+          transcriptionStatus.value = "Audio loaded successfully. Ready for playback.";
+          
+          // Create a mock file object for display purposes
+          const fileName = audioPath.split(/[\\/]/).pop() || 'audio.wav';
+          // We can't create a real File object from a path, but we can store the filename
+          // The audio playback will work with originalAudioBase64.value
+          
+          // Create audio player
+          createAudioPlayer();
+          
+          // Hide any warning that might be showing
+          showAudioWarning.value = false;
+        }
+      } catch (error) {
+        console.error("Error loading audio file:", error);
+        showAudioFileWarning(audioPath);
+      }
+    } else {
+      // File doesn't exist, show warning
+      showAudioFileWarning(audioPath);
+    }
+  } catch (error) {
+    // Error checking file existence, show warning
+    showAudioFileWarning(audioPath);
+  }
+}
+
+function showAudioFileWarning(audioPath: string) {
+  showAudioWarning.value = true;
+  missingAudioPath.value = audioPath;
+  transcriptionStatus.value = "Transcript loaded successfully. Audio file not found.";
+}
+
+function selectCorrectAudioFile() {
+  // Create a file input specifically for loading audio without processing
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = '.wav,.mp3,.m4a,.aac,.flac,.ogg';
+  fileInput.style.display = 'none';
+  
+  fileInput.addEventListener('change', async (event) => {
+    const target = event.target as HTMLInputElement;
+    if (target.files && target.files[0]) {
+      const selectedFile = target.files[0];
+      audioFile.value = selectedFile;
+      
+      try {
+        // Start loading indication
+        isLoadingAudio.value = true;
+        audioLoadingProgress.value = 0;
+        showAudioWarning.value = false; // Hide warning, show progress instead
+        
+        // Use chunked upload for large files
+        const chunkSize = 1024 * 1024; // 1MB chunks
+        const totalChunks = Math.ceil(selectedFile.size / chunkSize);
+        
+        // Generate a unique session ID for this upload
+        const sessionId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
+        
+        let processedFilePath = "";
+        
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * chunkSize;
+          const end = Math.min(start + chunkSize, selectedFile.size);
+          const chunk = selectedFile.slice(start, end);
+          
+          const chunkArray = new Uint8Array(await chunk.arrayBuffer());
+          const result = await invoke('save_audio_file_chunked', {
+            chunkData: Array.from(chunkArray),
+            chunkIndex: i,
+            totalChunks: totalChunks,
+            filename: selectedFile.name,
+            sessionId: sessionId
+          });
+          
+          // The last chunk returns the final processed file path
+          if (i === totalChunks - 1) {
+            processedFilePath = result as string;
+          }
+          
+          // Update progress (upload is 80% of total progress)
+          const uploadProgress = ((i + 1) / totalChunks) * 80;
+          audioLoadingProgress.value = uploadProgress;
+          transcriptionStatus.value = `Uploading audio: ${Math.round(uploadProgress)}%`;
+        }
+        
+        // Convert the saved file to base64 for playback (remaining 20%)
+        audioLoadingProgress.value = 85;
+        transcriptionStatus.value = "Processing audio for playback...";
+        
+        const result = await invoke('convert_audio_to_base64', {
+          filePath: processedFilePath,
+        });
+        
+        if (typeof result === 'string') {
+          audioLoadingProgress.value = 100;
+          originalAudioBase64.value = result;
+          transcriptionStatus.value = "Audio loaded successfully. Ready for playback.";
+          
+          // Create audio player
+          createAudioPlayer();
+        }
+      } catch (error) {
+        console.error("Error loading audio:", error);
+        errorMsg.value = `Error loading audio file: ${error}`;
+        // Show warning again if loading failed
+        showAudioWarning.value = true;
+      } finally {
+        // Hide loading indication
+        isLoadingAudio.value = false;
+        audioLoadingProgress.value = 0;
+      }
+    }
+    
+    // Clean up the temporary input
+    document.body.removeChild(fileInput);
+  });
+  
+  // Add to DOM and trigger click
+  document.body.appendChild(fileInput);
+  fileInput.click();
+}
+
+function parseNoscribeTranscript(bodyElement: HTMLElement): any[] {
+  const segments: any[] = [];
+  
+  // Look for noscribe-specific structure: <p><a name="...">Speaker: [timestamp] text</a></p>
+  const paragraphs = Array.from(bodyElement.querySelectorAll('p')).filter(p => p.querySelector('a'));
+  
+  paragraphs.forEach((p) => {
+    const anchorElement = p.querySelector('a');
+    if (!anchorElement) return;
+    
+    const fullText = anchorElement.textContent?.trim();
+    if (!fullText) return;
+    
+    // Parse the noscribe format: "S03: [00:00:14] Ja, gerne. Wir können gerne ausführlich werden und ausschweifend."
+    const timestampMatch = fullText.match(/\[(\d{2}):(\d{2}):(\d{2})\]/);
+    if (!timestampMatch) {
+      console.warn("No valid timestamp found in:", fullText);
+      return; // Skip this segment if no timestamp found
+    }
+    
+    const hours = parseInt(timestampMatch[1]);
+    const minutes = parseInt(timestampMatch[2]);
+    const seconds = parseInt(timestampMatch[3]);
+    const startTimeSeconds = hours * 3600 + minutes * 60 + seconds;
+    
+    // Extract speaker and text
+    const speakerMatch = fullText.match(/^([^:]+):/);
+    const speaker = speakerMatch ? speakerMatch[1].trim() : '';
+    
+    // Extract the actual transcription text (everything after the timestamp)
+    const textAfterTimestamp = fullText.substring(fullText.indexOf(']') + 1).trim();
+    const transcriptionText = textAfterTimestamp || fullText;
+    
+    // Estimate duration based on text length (roughly 3 words per second)
+    const wordCount = transcriptionText.split(/\s+/).length;
+    const estimatedDuration = Math.max(wordCount / 3, 2); // At least 2 seconds
+    const endTimeSeconds = startTimeSeconds + estimatedDuration;
+    
+    segments.push({
+      start_sample: Math.floor(startTimeSeconds * 16000), // Assuming 16kHz sample rate
+      end_sample: Math.floor(endTimeSeconds * 16000),
+      start_time_seconds: startTimeSeconds,
+      end_time_seconds: endTimeSeconds,
+      audio_data: [],
+      audio_base64: '', // No audio data in imported file
+      transcription: `${speaker ? speaker + ': ' : ''}${transcriptionText}`,
+      isTranscribing: false,
+      transcriptionError: null
+    });
+  });
+  
+  // If no properly formatted segments found, fall back to basic parsing
+  if (segments.length === 0) {
+    paragraphs.forEach((p, index) => {
+      const text = p.textContent?.trim();
+      if (text && text.length > 0) {
+        const estimatedDuration = Math.max(text.length / 100, 3);
+        const startTime = index * estimatedDuration;
+        const endTime = startTime + estimatedDuration;
+        
+        segments.push({
+          start_sample: Math.floor(startTime * 16000),
+          end_sample: Math.floor(endTime * 16000),
+          start_time_seconds: startTime,
+          end_time_seconds: endTime,
+          audio_data: [],
+          audio_base64: '',
+          transcription: text,
+          isTranscribing: false,
+          transcriptionError: null
+        });
+      }
+    });
+  }
+  
+  return segments;
+}
+
 async function handleFileSelect(event: Event) {
   const target = event.target as HTMLInputElement;
   if (target.files && target.files[0]) {
@@ -157,35 +436,56 @@ async function processAudio() {
   processingStep.value = "Preparing audio file...";
 
   try {
-    // Frontend preparation steps (quick operations)
-    processingStep.value = "Reading audio file...";
+    // Use chunked upload to avoid JavaScript memory limits with large files
+    processingStep.value = "Preparing audio file...";
     processingProgress.value = 2;
     
-    const arrayBuffer = await audioFile.value.arrayBuffer();
-    const bytes = Array.from(new Uint8Array(arrayBuffer));
+    // Generate a unique session ID for this upload
+    const sessionId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
     
-    processingStep.value = "Encoding audio for playback...";
+    // Read file in chunks to avoid memory issues
+    const file = audioFile.value;
+    const chunkSize = 1024 * 1024; // 1MB chunks
+    const totalChunks = Math.ceil(file.size / chunkSize);
+    
+    processingStep.value = `Uploading file (0/${totalChunks} chunks)...`;
     processingProgress.value = 5;
     
-    const uint8Array = new Uint8Array(arrayBuffer);
-    let binaryString = '';
-    const chunkSize = 8192;
+    let tempFilePath = "";
     
-    for (let i = 0; i < uint8Array.length; i += chunkSize) {
-      const chunk = uint8Array.slice(i, i + chunkSize);
-      binaryString += String.fromCharCode.apply(null, Array.from(chunk));
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * chunkSize;
+      const end = Math.min(start + chunkSize, file.size);
+      const chunk = file.slice(start, end);
+      const chunkArrayBuffer = await chunk.arrayBuffer();
+      const chunkBytes = Array.from(new Uint8Array(chunkArrayBuffer));
+      
+      processingStep.value = `Uploading file (${chunkIndex + 1}/${totalChunks} chunks)...`;
+      processingProgress.value = 5 + (chunkIndex / totalChunks) * 3; // 5-8% for upload
+      
+      const result = await invoke("save_audio_file_chunked", {
+        chunkData: chunkBytes,
+        chunkIndex: chunkIndex,
+        totalChunks: totalChunks,
+        filename: file.name,
+        sessionId: sessionId
+      });
+      
+      // The last chunk returns the final file path
+      if (chunkIndex === totalChunks - 1) {
+        tempFilePath = result as string;
+      }
     }
     
-    originalAudioBase64.value = btoa(binaryString);
-    createAudioPlayer();
-    
-    processingStep.value = "Saving audio file...";
+    processingStep.value = "Preparing audio for playback...";
     processingProgress.value = 8;
     
-    const tempFilePath = await invoke("save_audio_file", { 
-      fileData: bytes, 
-      filename: audioFile.value.name 
-    });
+    // Convert audio to base64 in the backend (handles large files better)
+    originalAudioBase64.value = await invoke("convert_audio_to_base64", { 
+      filePath: tempFilePath 
+    }) as string;
+    
+    createAudioPlayer();
     
     // Backend processing with real progress events
     processingStep.value = "Initializing audio processing...";
@@ -715,6 +1015,11 @@ function openAudioFile() {
   closeAllMenus();
 }
 
+function openNoscribeFile() {
+  document.getElementById('noscribe-file')?.click();
+  closeAllMenus();
+}
+
 function openProject() {
   document.getElementById('load-project')?.click();
   closeAllMenus();
@@ -777,6 +1082,10 @@ function copyAll() {
             <div class="menu-option" @click="openAudioFile">
               <span class="menu-icon">♪</span>
               <span>Open Audio File...</span>
+            </div>
+            <div class="menu-option" @click="openNoscribeFile">
+              <span class="menu-icon">📋</span>
+              <span>Import Noscribe HTML...</span>
             </div>
             <div class="menu-separator"></div>
             <div class="menu-option" @click="saveProjectFromMenu" :class="{ disabled: vadResults.length === 0 }">
@@ -859,7 +1168,6 @@ function copyAll() {
           v-model="projectName" 
           class="project-title"
           placeholder="Untitled Project"
-          @keydown.enter="$event.target.blur()"
         />
       </div>
       
@@ -890,9 +1198,56 @@ function copyAll() {
       id="audio-file"
       style="display: none;"
     />
+    <input 
+      type="file" 
+      accept=".html,.htm"
+      @change="importNoscribeFile"
+      id="noscribe-file"
+      style="display: none;"
+    />
 
     <!-- Main Content Area -->
     <div class="main-content">
+      <!-- Audio File Warning -->
+      <div v-if="showAudioWarning && !isLoadingAudio" class="warning-banner">
+        <div class="warning-content">
+          <div class="warning-icon">⚠️</div>
+          <div class="warning-text">
+            <strong>Audio file not found:</strong> {{ missingAudioPath }}
+            <br>
+            <small>The imported transcript references an audio file that could not be loaded.</small>
+          </div>
+          <button @click="selectCorrectAudioFile" class="warning-button">
+            Select Audio File
+          </button>
+          <button @click="showAudioWarning = false" class="warning-dismiss">
+            ×
+          </button>
+        </div>
+      </div>
+
+      <!-- Audio Loading Progress -->
+      <div v-if="isLoadingAudio" class="progress-banner">
+        <div class="progress-content">
+          <div class="progress-icon">⌛</div>
+          <div class="progress-text">
+            <strong>Loading Audio File</strong>
+            <br>
+            <small>{{ transcriptionStatus }}</small>
+          </div>
+          <div class="progress-section">
+            <div class="progress-bar-container">
+              <div class="progress-bar-track">
+                <div 
+                  class="progress-bar-fill" 
+                  :style="{ width: `${audioLoadingProgress}%` }"
+                ></div>
+              </div>
+            </div>
+            <span class="progress-percentage">{{ Math.round(audioLoadingProgress) }}%</span>
+          </div>
+        </div>
+      </div>
       <!-- Processing Indicator -->
       <div v-if="isProcessing" class="processing-section">
         <div class="processing-card">
@@ -960,6 +1315,14 @@ function copyAll() {
             Select Audio File
           </button>
           <p class="file-hint">Supports WAV, MP3, M4A, AAC, FLAC, and OGG formats</p>
+          
+          <div style="margin: 20px 0; text-align: center; color: #888;">OR</div>
+          
+          <button @click="openNoscribeFile" class="button secondary">
+            <span style="margin-right: 8px;">📋</span>
+            Import Noscribe HTML
+          </button>
+          <p class="file-hint">Import existing transcripts from noscribe HTML files</p>
         </div>
       </div>
 
@@ -1363,6 +1726,125 @@ function copyAll() {
   flex: 1;
   padding: 20px;
   padding-bottom: 300px;
+}
+
+/* Warning Banner */
+.warning-banner {
+  background: #fff3cd;
+  border: 1px solid #ffeaa7;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.warning-content {
+  display: flex;
+  align-items: center;
+  padding: 16px;
+  gap: 12px;
+}
+
+.warning-icon {
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.warning-text {
+  flex: 1;
+  color: #856404;
+  line-height: 1.4;
+}
+
+.warning-text strong {
+  color: #533f03;
+}
+
+.warning-text small {
+  color: #6c5f04;
+}
+
+.warning-button {
+  background: #ffc107;
+  color: #212529;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  flex-shrink: 0;
+}
+
+.warning-button:hover {
+  background: #e0a800;
+}
+
+.warning-dismiss {
+  background: none;
+  border: none;
+  font-size: 20px;
+  color: #856404;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: background-color 0.2s;
+  flex-shrink: 0;
+}
+
+.warning-dismiss:hover {
+  background: rgba(0,0,0,0.1);
+}
+
+/* Progress Banner */
+.progress-banner {
+  background: #e3f2fd;
+  border: 1px solid #90caf9;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.progress-content {
+  display: flex;
+  align-items: center;
+  padding: 16px;
+  gap: 12px;
+}
+
+.progress-icon {
+  font-size: 24px;
+  flex-shrink: 0;
+  animation: spin 1s linear infinite;
+}
+
+.progress-text {
+  flex: 1;
+  color: #1565c0;
+  line-height: 1.4;
+}
+
+.progress-text strong {
+  color: #0d47a1;
+}
+
+.progress-text small {
+  color: #1976d2;
+}
+
+.progress-section {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 200px;
+  flex-shrink: 0;
+}
+
+.progress-percentage {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1976d2;
+  min-width: 40px;
 }
 
 .processing-section {
