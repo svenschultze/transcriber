@@ -252,13 +252,91 @@ async fn check_file_exists(file_path: String) -> Result<bool, String> {
     Ok(path.exists() && path.is_file())
 }
 
+#[tauri::command]
+async fn extract_segment_audio(
+    original_audio_base64: String,
+    start_time_seconds: f64,
+    end_time_seconds: f64
+) -> Result<String, String> {
+    use base64;
+    use std::env;
+    use std::fs;
+    
+    // Decode the base64 audio data (this is the compressed MP3/etc file)
+    let audio_bytes = base64::decode(&original_audio_base64)
+        .map_err(|e| format!("Failed to decode base64 audio: {}", e))?;
+    
+    // Determine the file extension from the audio data
+    let file_extension = if audio_bytes.len() > 4 {
+        // Check for MP3 header (ID3 tag or frame sync)
+        if audio_bytes.starts_with(b"ID3") || 
+           (audio_bytes.len() > 2 && audio_bytes[0] == 0xFF && (audio_bytes[1] & 0xE0) == 0xE0) {
+            "mp3"
+        }
+        // Check for WAV header
+        else if audio_bytes.starts_with(b"RIFF") && audio_bytes.len() > 8 && &audio_bytes[8..12] == b"WAVE" {
+            "wav"
+        }
+        // Check for M4A/AAC header
+        else if audio_bytes.len() > 8 && &audio_bytes[4..8] == b"ftyp" {
+            "m4a"
+        }
+        // Check for FLAC header
+        else if audio_bytes.starts_with(b"fLaC") {
+            "flac"
+        }
+        // Check for OGG header
+        else if audio_bytes.starts_with(b"OggS") {
+            "ogg"
+        }
+        else {
+            // Default to mp3 since that's most common for compressed audio
+            "mp3"
+        }
+    } else {
+        "mp3"
+    };
+    
+    // Create a temporary file for the original compressed audio
+    let temp_dir = env::temp_dir().join("transcriber_audio");
+    if !temp_dir.exists() {
+        fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp directory: {}", e))?;
+    }
+    
+    let temp_original_path = temp_dir.join(format!("original_{}.{}", chrono::Utc::now().timestamp_millis(), file_extension));
+    
+    // Write the compressed audio to a temporary file
+    fs::write(&temp_original_path, &audio_bytes)
+        .map_err(|e| format!("Failed to write original audio file: {}", e))?;
+    
+    // Use audio processor to extract the segment
+    let processor = AudioProcessor::new();
+    let (segment_samples, sample_rate) = processor.extract_segment_from_file(
+        &temp_original_path,
+        start_time_seconds,
+        end_time_seconds
+    ).map_err(|e| format!("Failed to extract segment: {}", e))?;
+    
+    // Convert segment samples to WAV bytes using the original sample rate
+    let segment_wav_bytes = processor.samples_to_wav_bytes(&segment_samples, sample_rate)
+        .map_err(|e| format!("Failed to convert segment to WAV: {}", e))?;
+    
+    // Encode to base64
+    let segment_base64 = base64::encode(&segment_wav_bytes);
+    
+    // Clean up temporary file
+    let _ = fs::remove_file(&temp_original_path);
+    
+    Ok(segment_base64)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![greet, process_audio_vad, select_audio_file, save_audio_file, save_audio_file_chunked, transcribe_audio, convert_audio_to_base64, check_file_exists])
+        .invoke_handler(tauri::generate_handler![greet, process_audio_vad, select_audio_file, save_audio_file, save_audio_file_chunked, transcribe_audio, convert_audio_to_base64, check_file_exists, extract_segment_audio])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
