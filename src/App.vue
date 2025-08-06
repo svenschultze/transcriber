@@ -325,10 +325,12 @@ function selectCorrectAudioFile() {
 
 function parseNoscribeTranscript(bodyElement: HTMLElement): any[] {
   const segments: any[] = [];
+  const tempSegments: any[] = [];
   
   // Look for noscribe-specific structure: <p><a name="...">Speaker: [timestamp] text</a></p>
   const paragraphs = Array.from(bodyElement.querySelectorAll('p')).filter(p => p.querySelector('a'));
   
+  // First pass: collect all segments with start times
   paragraphs.forEach((p) => {
     const anchorElement = p.querySelector('a');
     if (!anchorElement) return;
@@ -356,19 +358,34 @@ function parseNoscribeTranscript(bodyElement: HTMLElement): any[] {
     const textAfterTimestamp = fullText.substring(fullText.indexOf(']') + 1).trim();
     const transcriptionText = textAfterTimestamp || fullText;
     
-    // Estimate duration based on text length (roughly 3 words per second)
-    const wordCount = transcriptionText.split(/\s+/).length;
-    const estimatedDuration = Math.max(wordCount / 3, 2); // At least 2 seconds
-    const endTimeSeconds = startTimeSeconds + estimatedDuration;
+    tempSegments.push({
+      start_time_seconds: startTimeSeconds,
+      transcription: `${speaker ? speaker + ': ' : ''}${transcriptionText}`,
+    });
+  });
+  
+  // Second pass: calculate end times using next segment's start time
+  tempSegments.forEach((segment, index) => {
+    let endTimeSeconds;
+    
+    if (index < tempSegments.length - 1) {
+      // Use the start time of the next segment as the end time
+      endTimeSeconds = tempSegments[index + 1].start_time_seconds;
+    } else {
+      // For the last segment, estimate duration based on text length
+      const wordCount = segment.transcription.split(/\s+/).length;
+      const estimatedDuration = Math.max(wordCount / 3, 2); // At least 2 seconds
+      endTimeSeconds = segment.start_time_seconds + estimatedDuration;
+    }
     
     segments.push({
-      start_sample: Math.floor(startTimeSeconds * 16000), // Assuming 16kHz sample rate
+      start_sample: Math.floor(segment.start_time_seconds * 16000), // Assuming 16kHz sample rate
       end_sample: Math.floor(endTimeSeconds * 16000),
-      start_time_seconds: startTimeSeconds,
+      start_time_seconds: segment.start_time_seconds,
       end_time_seconds: endTimeSeconds,
       audio_data: [],
       audio_base64: '', // No audio data in imported file
-      transcription: `${speaker ? speaker + ': ' : ''}${transcriptionText}`,
+      transcription: segment.transcription,
       isTranscribing: false,
       transcriptionError: null
     });
@@ -704,21 +721,40 @@ function handleSegmentEdit(event: Event, segment: any, index: number) {
 }
 
 async function transcribeSegment(segment: any, index: number) {
-  if (!segment.audio_base64) {
-    // We'll need to extract the segment audio from the original file
-    // For now, we'll pass the segment info to the backend to handle extraction
-    errorMsg.value = "No audio data available for this segment";
-    return;
-  }
 
   // Mark this segment as transcribing
   segment.isTranscribing = true;
   segment.transcriptionError = null;
 
   try {
+    let audioBase64ToUse = segment.audio_base64;
+    
+    // If the segment doesn't have audio_base64 (e.g., from noscribe import),
+    // we need to extract it from the original audio file
+    if (!audioBase64ToUse && originalAudioBase64.value) {
+      try {
+        // Use the Rust backend to extract the segment audio from the original file
+        audioBase64ToUse = await invoke("extract_segment_audio", {
+          originalAudioBase64: originalAudioBase64.value,
+          startTimeSeconds: segment.start_time_seconds,
+          endTimeSeconds: segment.end_time_seconds
+        });
+      } catch (extractError) {
+        console.error("Error extracting segment audio:", extractError);
+        segment.transcriptionError = `Error extracting audio: ${extractError}`;
+        return;
+      }
+    }
+    
+    // Check if we have audio data to transcribe
+    if (!audioBase64ToUse) {
+      segment.transcriptionError = "No audio data available for this segment";
+      return;
+    }
+
     // Call the Rust backend for transcription
     const transcription = await invoke("transcribe_audio", { 
-      audioBase64: segment.audio_base64, 
+      audioBase64: audioBase64ToUse, 
       segmentIndex: index,
       apiKey: apiKey.value,
       baseUrl: baseUrl.value,
@@ -1339,10 +1375,33 @@ function copyAll() {
           
           <div class="transcription-text">
             <div v-for="(segment, index) in vadResults" :key="index" class="segment-line">
-              <div v-if="segment.transcription != null" class="segment-container" :class="{ 'highlighted': currentHighlightedSegment === index }">
+              <div v-if="segment.isTranscribing" class="segment-container loading" :class="{ 'highlighted': currentHighlightedSegment === index }">
                 <div class="segment-meta">
                   <span class="segment-number">{{ index + 1 }}</span>
                   <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
+                  <button 
+                    class="retranscribe-button" 
+                    disabled
+                    title="Transcribing in progress...">
+                    ⌛
+                  </button>
+                </div>
+                <span class="transcribing-segment">
+                  <span style="margin-right: 4px;">⌛</span>
+                  Transcribing...
+                </span>
+              </div>
+              <div v-else-if="segment.transcription != null" class="segment-container" :class="{ 'highlighted': currentHighlightedSegment === index }">
+                <div class="segment-meta">
+                  <span class="segment-number">{{ index + 1 }}</span>
+                  <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
+                  <button 
+                    class="retranscribe-button" 
+                    @click="transcribeSegment(segment, index)"
+                    :disabled="segment.isTranscribing || isTranscribing"
+                    title="Retranscribe this segment">
+                    🔄
+                  </button>
                 </div>
                 <span 
                   class="transcribed-segment" 
@@ -1353,24 +1412,21 @@ function copyAll() {
                   spellcheck="false"
                   title="CTRL+Click to play audio segment">{{ segment.transcription }}</span>
               </div>
-              <div v-else-if="segment.isTranscribing" class="segment-container loading" :class="{ 'highlighted': currentHighlightedSegment === index }">
-                <div class="segment-meta">
-                  <span class="segment-number">{{ index + 1 }}</span>
-                  <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
-                </div>
-                <span class="transcribing-segment">
-                  <span style="margin-right: 4px;">⌛</span>
-                  Transcribing...
-                </span>
-              </div>
               <div v-else-if="segment.transcriptionError" class="segment-container error" :class="{ 'highlighted': currentHighlightedSegment === index }">
                 <div class="segment-meta">
                   <span class="segment-number">{{ index + 1 }}</span>
                   <span class="segment-time">{{ formatTime(segment.start_time_seconds) }}</span>
+                  <button 
+                    class="retranscribe-button" 
+                    @click="transcribeSegment(segment, index)"
+                    :disabled="segment.isTranscribing || isTranscribing"
+                    title="Retry transcription">
+                    🔄
+                  </button>
                 </div>
                 <span class="error-segment" :title="`Error: ${segment.transcriptionError}`">
                   <span style="margin-right: 4px;">⚠</span>
-                  Error
+                  Error: {{ segment.transcriptionError }}
                 </span>
               </div>
               <div v-else class="segment-container processing" :class="{ 'highlighted': currentHighlightedSegment === index }">
@@ -2200,6 +2256,36 @@ function copyAll() {
   font-size: 0.75rem;
   color: #666;
   font-family: monospace;
+}
+
+.retranscribe-button {
+  background: #e3f2fd;
+  border: 1px solid #90caf9;
+  border-radius: 4px;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  padding: 0;
+  margin-top: 2px;
+}
+
+.retranscribe-button:hover:not(:disabled) {
+  background: #bbdefb;
+  border-color: #64b5f6;
+  transform: scale(1.1);
+}
+
+.retranscribe-button:disabled {
+  background: #f5f5f5;
+  border-color: #e0e0e0;
+  color: #bdbdbd;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .transcribed-segment {

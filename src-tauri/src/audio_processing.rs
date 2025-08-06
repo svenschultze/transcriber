@@ -503,4 +503,32 @@ impl AudioProcessor {
         
         Ok(wav_data)
     }
+    
+    // Extract a segment from an audio file by time range
+    pub fn extract_segment_from_file(
+        &self,
+        file_path: &std::path::Path,
+        start_time_seconds: f64,
+        end_time_seconds: f64,
+    ) -> Result<(Vec<i16>, u32), Box<dyn std::error::Error>> {
+        // Decode the full audio file
+        let (audio_samples, sample_rate) = self.decode_audio_symphonia(file_path.to_str().unwrap())?;
+        
+        // Calculate sample indices
+        let start_sample = (start_time_seconds * sample_rate as f64) as usize;
+        let end_sample = (end_time_seconds * sample_rate as f64) as usize;
+        
+        // Ensure we don't go out of bounds
+        let start_sample = start_sample.min(audio_samples.len());
+        let end_sample = end_sample.min(audio_samples.len());
+        
+        if start_sample >= end_sample {
+            return Err("Invalid time range: start time is after end time".into());
+        }
+        
+        // Extract the segment
+        let segment_samples = audio_samples[start_sample..end_sample].to_vec();
+        
+        Ok((segment_samples, sample_rate))
+    }
 }
